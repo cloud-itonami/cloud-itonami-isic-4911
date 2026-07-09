@@ -1,0 +1,11 @@
+{:itonami.blueprint/id "cloud-itonami-4911"
+ :itonami.blueprint/name "Community Passenger Rail Transport"
+ :itonami.blueprint/isic-rev5 "4911"
+ :itonami.blueprint/domain :transport/passenger-rail
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:rail-safety :regional-connectivity :passenger-rights]
+ :itonami.blueprint/governor :rail-safety-governor
+ :itonami.blueprint/robotics true
+ :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :logistics]
+ :itonami.blueprint/optional-technologies [:optimization]
+ :itonami.blueprint/status :public-oss}
