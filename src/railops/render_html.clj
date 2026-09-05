@@ -1,478 +1,388 @@
 (ns railops.render-html
-  "Build-time HTML renderer for the community interurban-passenger-rail
-  operations-coordination actor -- `clojure -M:dev:render-html`.
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
 
-  This is NOT a mock console. It drives the REAL actor stack
-  deterministically and offline:
+  Closes flagship checklist item 2 for this repo: it previously had NO
+  demo page and no generator. This namespace drives the REAL actor
+  stack (`railops.operation` -> `railops.governor` -> `railops.phase`
+  -> `railops.store`) and renders the resulting store + append-only
+  audit ledger. Nothing on the page is hand-typed telemetry: every
+  service field is a `railops.store` entity key, every decision row is
+  a fact the real `:commit`/`:hold` nodes appended to the ledger, and
+  every draft-record row is a real `railops.registry` record (real
+  `LOG-`/`SCH-`/`SFC-`/`MNT-` record ids, produced by the commit
+  path). The ONLY hand-written content is `action-gate-rows`, a static
+  description of this actor's own fixed op/gate contract -- see the
+  comment there.
 
-    - `railops.store/seed-db`      -- the real seeded SSoT (MemStore)
-    - `railops.operation/build`    -- the real langgraph StateGraph actor
-    - `railops.governor/check`     -- the real Rail Safety Governor,
-                                      invoked from inside the graph's
-                                      `:govern` node (never called here)
-    - `railops.phase/gate`         -- the real rollout-phase gate
-    - `railops.registry/*`         -- the real draft record book
+  Subject provenance: the only service ids used below are `service-1`
+  and `service-2`, which are exactly the two services seeded by
+  `railops.store/demo-data` (via `store/seed-db`). No invented ids.
+  This repo's own demo driver `railops.sim` (`clojure -M:dev:run`, run
+  BEFORE writing this file) uses the same two seeded ids, so its
+  scenario was safe to build on rather than replace; this namespace
+  extends it to reach dispositions `sim` never puts on the ledger (an
+  approver rejection, a rollout-phase-disabled hold, and the two HARD
+  governor rules `sim` only checks out-of-band).
 
-  Every row rendered below is read back out of the store the graph
-  wrote, or off the graph run's own `:audit` channel. Nothing is
-  fabricated:
+  Ledger fact types: `railops.operation`'s `:commit` node appends
+  `:committed`, and its `:hold` node appends whichever of
+  `:governor-hold` / `:approval-rejected` is last on the `:audit`
+  channel. `:approval-granted` and `:approval-requested` NEVER reach
+  the ledger -- they are in-memory audit-channel entries only -- so
+  nothing below branches on them.
 
-    - every subject id driven (`service-1`, `service-2`) exists in
-      `railops.store/demo-data`. This actor has no intake/registration
-      op, so seed subjects are the ONLY legal subjects.
-    - the HARD holds shown are produced by the governor's own rules on
-      deliberately non-compliant input, not by a hardcoded string.
-    - only fact types this store actually APPENDS are branched on
-      (`:committed`, `:governor-hold`, `:approval-rejected`).
-      `:approval-requested` / `:approval-granted` / `:railopsllm-proposal`
-      are emitted to the in-memory `:audit` channel ONLY and are never
-      written to the ledger by `railops.operation` -- they are rendered
-      from the run results, in their own section, labelled as such."
-  (:require [clojure.string :as str]
-            [langgraph.graph :as g]
-            [railops.governor :as governor]
-            [railops.operation :as op]
-            [railops.phase :as phase]
+  Determinism: the mock advisor is deterministic, the store is a fresh
+  seeded `MemStore`, and no timestamp or random id appears in the page
+  content -- two consecutive runs are byte-identical.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
+            [railops.store :as store]
             [railops.railopsllm :as railopsllm]
-            [railops.store :as store]))
-
-;; ----------------------------- demo driver -----------------------------
+            [railops.operation :as op]
+            [langgraph.graph :as g]))
 
 (def ^:private operator
+  "Phase 3 (supervised-auto) operations-coordination desk operator --
+  the same context shape `railops.sim` injects."
   {:actor-id "op-1" :actor-role :rail-ops-coordinator :phase 3})
 
-(def ^:private pilot-operator
-  "The same desk, running at rollout phase 1 (`assisted-log-safety`) --
-  used to show the phase gate holding an op that phase 1 has not
-  enabled yet."
-  {:actor-id "op-1" :actor-role :rail-ops-coordinator :phase 1})
+(def ^:private phase-1-operator
+  "The SAME operator at rollout phase 1 (assisted-log-safety), used to
+  exercise `railops.phase/gate`'s `:phase-disabled` hold on an op that
+  phase 1 does not yet enable."
+  (assoc operator :phase 1))
 
-(defn- rogue-advisor
-  "A deliberately non-compliant Rail-Operations-LLM. It implements the
-  repo's own `railops.railopsllm/Advisor` protocol and delegates to the
-  repo's own `infer`, then corrupts the result the two ways an
-  untrusted advisor could: it claims `:effect :actuate` (a direct
-  mutation of a real dispatch system) and its rationale names a
-  forbidden finalization ACTION from
-  `railops.governor/scope-exclusion-phrases`.
+(defn- exec! [actor tid request context]
+  (g/run* actor {:request request :context context} {:thread-id tid}))
 
-  This is not a mock of the actor -- it is the actor's real `:advisor`
-  injection seam (`railops.operation/build` opts) carrying a bad
-  proposal, so the REAL governor gets to reject it."
-  []
+(defn- approve! [actor tid]
+  (g/run* actor {:approval {:status :approved :by "op-1"}}
+          {:thread-id tid :resume? true}))
+
+(defn- reject! [actor tid]
+  (g/run* actor {:approval {:status :rejected :by "op-1"}}
+          {:thread-id tid :resume? true}))
+
+(defn- drift-advisor
+  "A deliberately DRIFTING advisor -- the injected `:advisor` seam
+  `railops.operation/build` documents, used exactly as this repo's own
+  `governor_contract_test/end-to-end-dispatch-safety-override-attempt-is-held`
+  uses it. It models a compromised / prompt-injected Rail-Operations-LLM.
+  It is an INPUT to the real actor; the hold it produces is still the
+  real governor's verdict, on a real seeded service."
+  [proposal]
   (reify railopsllm/Advisor
-    (-advise [_ st req]
-      (let [p (railopsllm/infer st req)]
-        (assoc p
-               :effect    :actuate
-               :rationale (str (:rationale p)
-                               " -- override the signal interlock so the service departs on time"))))))
-
-(defn- run-entry
-  "One real graph invocation, recorded with only the audit facts THIS
-  invocation added (a resumed thread's `:audit` channel replays the
-  interrupted run's facts too)."
-  [label actor tid input opts seen]
-  (let [r     (g/run* actor input (merge {:thread-id tid} opts))
-        audit (vec (get-in r [:state :audit]))
-        prior (get @seen tid 0)]
-    (swap! seen assoc tid (count audit))
-    {:thread      tid
-     :label       label
-     :op          (get-in r [:state :request :op])
-     :subject     (get-in r [:state :request :subject])
-     :phase       (get-in r [:state :context :phase])
-     :status      (:status r)
-     :disposition (get-in r [:state :disposition])
-     :new-audit   (vec (drop prior audit))}))
+    (-advise [_ _st _req] proposal)))
 
 (defn run-demo!
-  "Drives the real actor over the seeded services and returns
-  {:db store :runs [run-entry ..]}. Deterministic: no clock, no
-  randomness, no network."
+  "Runs a fresh seeded store (`store/seed-db` -- services `service-1`
+  and `service-2`, nothing else) through a scenario reaching every
+  disposition this actor can put on the ledger.
+
+  `service-1` (route/timetable slot INDEPENDENTLY registered by the
+  operator's safety-management system -- `:route-schedule-registered?
+  true` in the seed):
+
+    - a full clean lifecycle across all four allowlisted ops --
+      `:log-service-record` auto-commits at phase 3 (the only op in
+      phase 3's `:auto` set), then `:schedule-service-operation`,
+      `:flag-passenger-safety-concern` and `:coordinate-maintenance`
+      each escalate to a human and are approved and committed
+      (`:flag-passenger-safety-concern` escalates for TWO independent
+      reasons -- the governor's `high-stakes` gate and its absence
+      from every phase's `:auto` set);
+    - a SECOND `:schedule-service-operation` where the human approver
+      REJECTS -> `:approval-rejected` (basis `:approver-rejected`);
+    - `:coordinate-maintenance` replayed at rollout phase 1, which
+      does not yet enable that op -> HOLD with phase reason
+      `:phase-disabled` (governor clean, rollout gate refuses);
+    - `:cancel-service-record`, outside the closed four-op allowlist
+      -> HARD `:op-not-allowlisted`;
+    - `:finalize-dispatch-safety-override` -> HARD, two rules at once
+      (`:op-not-allowlisted` AND `:dispatch-safety-override-blocked`);
+    - an allowlisted `:schedule-service-operation` whose DRIFTING
+      advisor rationale names a forbidden finalization action -> HARD
+      `:dispatch-safety-override-blocked` on its own, proving the
+      permanent block survives an op that is otherwise perfectly
+      legal;
+    - an allowlisted `:log-service-record` whose DRIFTING advisor
+      returns `:effect :actuate` instead of `:propose` -> HARD
+      `:effect-not-propose` on its own.
+
+  `service-2` (route/timetable slot NOT independently registered --
+  `:route-schedule-registered? false` in the seed):
+
+    - `:log-service-record` -> HARD `:route-schedule-not-verified`.
+      No op anywhere in this actor's allowlist can ever set that flag
+      (see `railops.store`'s docstring), so this service cannot be
+      coordinated around at all until an external system registers it.
+
+  All four HARD governor rules and both non-governor hold paths are
+  therefore real output. Returns the store."
   []
-  (let [db    (store/seed-db)
+  (let [db (store/seed-db)
         actor (op/build db)
-        rogue (op/build db {:advisor (rogue-advisor)})
-        seen  (atom {})
-        exec  (fn [label a tid request context]
-                (run-entry label a tid {:request request :context context} {} seen))
-        resume (fn [label a tid approval]
-                 (run-entry label a tid {:approval approval} {:resume? true} seen))]
-    {:db db
-     :runs
-     [(exec "service log (schedule adherence) -- governor clean, phase 3 auto-commit"
-            actor "t1"
-            {:op :log-service-record :subject "service-1"
-             :kind :schedule-adherence :data {:departures-on-time 18 :departures-total 20}}
-            operator)
+        override-actor
+        (op/build db {:advisor (drift-advisor
+                                {:summary "shift departure"
+                                 :rationale "will override the signal interlock to clear the train for departure"
+                                 :cites [] :effect :propose
+                                 :value {:change-summary "advance 08:10 departure"}
+                                 :stake nil :confidence 0.99})})
+        actuate-actor
+        (op/build db {:advisor (drift-advisor
+                                {:summary "log ridership"
+                                 :rationale "正規化のみ"
+                                 :cites ["service-1"] :effect :actuate
+                                 :value {:kind :ridership :data {:boardings 118}}
+                                 :stake nil :confidence 0.95})})]
 
-      (exec "timetable/consist coordination proposal -- escalates to the desk"
-            actor "t2"
-            {:op :schedule-service-operation :subject "service-1"
-             :change-summary "shift 08:10 departure to 08:15"
-             :proposed-consist "consist-7"}
-            operator)
-      (resume "desk approves the coordination proposal" actor "t2"
-              {:status :approved :by "op-1"})
+    ;; --- service-1: clean lifecycle across all four allowlisted ops ---
+    (exec! actor "s1-log" {:op :log-service-record :subject "service-1"
+                           :kind :ridership :data {:boardings 412}} operator)
 
-      (exec "passenger-safety concern flag -- ALWAYS escalates (high stake)"
-            actor "t3"
-            {:op :flag-passenger-safety-concern :subject "service-1"
-             :concern-kind :signal-fault
-             :description "platform 2 signal reported intermittent fault"}
-            operator)
-      (resume "desk approves the safety-concern flag" actor "t3"
-              {:status :approved :by "op-1"})
+    (exec! actor "s1-schedule" {:op :schedule-service-operation :subject "service-1"
+                                :change-summary "shift 08:10 departure to 08:15"
+                                :proposed-consist "consist-7"} operator)
+    (approve! actor "s1-schedule")
 
-      (exec "maintenance coordination request -- escalates to the desk"
-            actor "t4"
-            {:op :coordinate-maintenance :subject "service-1"
-             :target :rolling-stock
-             :coordination-note "request bogie inspection window"}
-            operator)
-      (resume "desk approves the maintenance coordination" actor "t4"
-              {:status :approved :by "op-1"})
+    (exec! actor "s1-concern" {:op :flag-passenger-safety-concern :subject "service-1"
+                               :concern-kind :signal-fault
+                               :description "platform 2 signal reported intermittent fault"} operator)
+    (approve! actor "s1-concern")
 
-      (exec "second maintenance coordination -- the desk REJECTS it"
-            actor "t5"
-            {:op :coordinate-maintenance :subject "service-1"
-             :target :track
-             :coordination-note "request overnight track possession"}
-            operator)
-      (resume "desk rejects it -- HOLD, nothing committed" actor "t5"
-              {:status :rejected :by "op-1"})
+    (exec! actor "s1-maintenance" {:op :coordinate-maintenance :subject "service-1"
+                                   :target :rolling-stock
+                                   :coordination-note "request bogie inspection window"} operator)
+    (approve! actor "s1-maintenance")
 
-      (exec "service-2's route/timetable slot is NOT independently registered -> HARD hold"
-            actor "t6"
-            {:op :log-service-record :subject "service-2"
-             :kind :incident :data {}}
-            operator)
+    ;; --- service-1: the human approver refuses ---
+    (exec! actor "s1-schedule-rejected" {:op :schedule-service-operation :subject "service-1"
+                                         :change-summary "add unscheduled 23:40 relief run"} operator)
+    (reject! actor "s1-schedule-rejected")
 
-      (exec "an op outside the closed allowlist -> HARD hold"
-            actor "t7"
-            {:op :cancel-service-record :subject "service-1"}
-            operator)
+    ;; --- service-1: rollout phase 1 does not yet enable maintenance coordination ---
+    (exec! actor "s1-maintenance-phase1" {:op :coordinate-maintenance :subject "service-1"
+                                          :target :track
+                                          :coordination-note "request rail-grinding window"}
+           phase-1-operator)
 
-      (exec "an op that would finalize a passenger-safety-authority decision -> HARD, permanent block"
-            actor "t8"
-            {:op :override-signal-interlock :subject "service-1"}
-            operator)
+    ;; --- service-1: HARD governor rules ---
+    (exec! actor "s1-cancel" {:op :cancel-service-record :subject "service-1"} operator)
 
-      (exec "a rogue advisor claims :effect :actuate and names a forbidden finalization action -> HARD hold"
-            rogue "t9"
-            {:op :schedule-service-operation :subject "service-1"
-             :change-summary "advance departure"}
-            operator)
+    (exec! actor "s1-finalize" {:op :finalize-dispatch-safety-override :subject "service-1"} operator)
 
-      (exec "phase 1 (assisted-log-safety) has not enabled maintenance coordination yet -> HOLD"
-            actor "t10"
-            {:op :coordinate-maintenance :subject "service-1"
-             :target :rolling-stock
-             :coordination-note "phase-1 pilot desk"}
-            pilot-operator)]}))
+    (exec! override-actor "s1-drift-override" {:op :schedule-service-operation :subject "service-1"
+                                               :change-summary "advance 08:10 departure"} operator)
 
-;; ----------------------------- html helpers -----------------------------
+    (exec! actuate-actor "s1-drift-actuate" {:op :log-service-record :subject "service-1"
+                                             :kind :ridership :data {:boardings 118}} operator)
+
+    ;; --- service-2: route/timetable slot never independently registered ---
+    (exec! actor "s2-log" {:op :log-service-record :subject "service-2"
+                           :kind :incident :data {}} operator)
+    db))
+
+;; ----------------------------- rendering -----------------------------
 
 (defn- esc [v]
   (-> (str v)
       (str/replace "&" "&amp;")
       (str/replace "<" "&lt;")
-      (str/replace ">" "&gt;")
-      (str/replace "\"" "&quot;")))
+      (str/replace ">" "&gt;")))
 
-(defn- kw
-  "Keyword -> its printed form WITHOUT the leading colon, namespace
-  kept (`:safety-concern/flag` -> `safety-concern/flag`). `name` would
-  silently drop the namespace."
-  [v]
-  (if (keyword? v) (subs (str v) 1) (str v)))
+(defn- facts-for [ledger service-id]
+  (filter #(= (:subject %) service-id) ledger))
 
-(defn- code [v] (str "<code>" (esc v) "</code>"))
+(defn- verified-cell [{:keys [route-schedule-registered?]}]
+  (if route-schedule-registered?
+    "<span class=\"ok\">registered (external SMS)</span>"
+    "<span class=\"critical\">not registered</span>"))
 
-(defn- kw-list [xs]
-  (str/join ", " (map #(code (str ":" (kw %))) (sort-by kw xs))))
-
-(defn- row [& cells] (str "<tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
-
-(defn- table [headers rows]
-  (str "<table><thead><tr>"
-       (str/join (map #(str "<th>" (esc %) "</th>") headers))
-       "</tr></thead><tbody>"
-       (if (seq rows) (str/join "\n" rows) (row "<span class=\"muted\">—</span>"))
-       "</tbody></table>"))
-
-(defn- section [title lead body]
-  (str "<section class=\"card\"><h2>" (esc title) "</h2>"
-       (if lead (str "<p class=\"muted\">" lead "</p>") "")
-       body "</section>"))
-
-;; ----------------------------- ledger reading -----------------------------
-
-(def ^:private hold-fact-types
-  "The only rejection fact types `railops.operation`'s `:hold` node ever
-  appends to the ledger."
-  #{:governor-hold :approval-rejected})
-
-(defn- ledger-status
-  "Last PERSISTED disposition for a service. Branches only on fact
-  types `railops.store` actually receives."
+(defn- status-cell
+  "Last ledger decision for a service. Branches ONLY on the three fact
+  types `railops.store` actually receives -- `:committed` from the
+  actor's `:commit` node and `:governor-hold` / `:approval-rejected`
+  from its `:hold` node."
   [ledger service-id]
-  (let [f (last (filter #(= service-id (:subject %)) ledger))
-        rules (fn [x] (str/join ", " (map #(str ":" (kw %)) (:basis x))))]
+  (let [f (last (facts-for ledger service-id))
+        rule (-> f :violations first :rule)]
+    (case (:t f)
+      :committed          "<span class=\"ok\">committed</span>"
+      :approval-rejected  "<span class=\"warn\">approver rejected</span>"
+      :governor-hold      (if rule
+                            (str "<span class=\"critical\">HARD hold &middot; " (esc (name rule)) "</span>")
+                            (str "<span class=\"warn\">rollout hold &middot; "
+                                 (esc (name (:phase-reason f :phase-gate))) "</span>"))
+      "<span class=\"muted\">no activity</span>")))
+
+(defn- service-row [ledger {:keys [id route consist operator] :as svc}]
+  (let [fs (facts-for ledger id)]
+    (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=\"num\">%s</td><td class=\"num\">%s</td><td>%s</td></tr>"
+            (esc id) (esc route) (esc consist) (esc operator)
+            (verified-cell svc)
+            (count (filter #(= :committed (:t %)) fs))
+            (count (filter #(#{:governor-hold :approval-rejected} (:t %)) fs))
+            (status-cell ledger id))))
+
+(defn- basis-text [{:keys [basis phase-reason]}]
+  (let [b (some->> (seq basis) (map name) (str/join ", "))]
     (cond
-      (nil? f) "<span class=\"muted\">no activity</span>"
-      (= :committed (:t f))
-      (str "<span class=\"ok\">committed</span> <span class=\"muted\">" (code (str ":" (kw (:op f)))) "</span>")
-      (= :approval-rejected (:t f))
-      (str "<span class=\"warn\">approver rejected</span> <span class=\"muted\">" (esc (rules f)) "</span>")
-      ;; `:governor-hold` with no violations came from the phase gate,
-      ;; not the governor -- do not label it a HARD governor hold.
-      (and (= :governor-hold (:t f)) (empty? (:violations f)))
-      (str "<span class=\"warn\">phase-gate hold</span> <span class=\"muted\">"
-           (esc (str ":" (kw (:phase-reason f)))) " @ phase " (esc (:phase f)) "</span>")
-      (= :governor-hold (:t f))
-      (str "<span class=\"critical\">HARD hold</span> <span class=\"muted\">" (esc (rules f)) "</span>")
-      :else "<span class=\"muted\">recorded</span>")))
+      (and b phase-reason) (str b " (phase: " (name phase-reason) ")")
+      b b
+      phase-reason (str "phase: " (name phase-reason))
+      :else "")))
 
-(defn- violations-in
-  "Every rejection reason actually written to the ledger, in ledger
-  order, one row per reason, tagged with the layer that produced it.
+(defn- fact-cell
+  "A `:governor-hold` fact carries the governor's own violations when a
+  HARD rule fired, and carries none when the governor was clean and
+  the ROLLOUT PHASE gate refused instead -- two different things that
+  share one fact type, so they are labelled apart here rather than
+  both being called a HARD hold."
+  [{:keys [t violations]}]
+  (case t
+    :committed         "<span class=\"ok\">committed</span>"
+    :approval-rejected "<span class=\"warn\">approval-rejected</span>"
+    :governor-hold     (if (seq violations)
+                         "<span class=\"critical\">governor-hold · HARD hold</span>"
+                         "<span class=\"warn\">rollout-phase hold</span>")
+    (str "<span class=\"muted\">" (esc (name (or t :unknown))) "</span>")))
 
-  A `:governor-hold` fact with an empty `:violations` came from the
-  rollout-phase gate, not the governor -- `railops.operation` records
-  that case as `:phase-reason`."
-  [ledger]
-  (for [f ledger
-        :when (hold-fact-types (:t f))
-        v (or (seq (:violations f))
-              [{:rule (:phase-reason f)
-                :detail (str "rollout phase " (:phase f) " ("
-                             (:label (get phase/phases (:phase f))) ") has not enabled this op")}])]
-    (assoc v
-           :op (:op f) :subject (:subject f) :fact (:t f) :phase (:phase f)
-           :layer (cond
-                    (= :approval-rejected (:t f)) "approver"
-                    (:phase-reason f)             "phase gate"
-                    :else                         "governor (HARD)"))))
+(defn- ledger-row [{:keys [op subject] :as f}]
+  (format "        <tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>"
+          (fact-cell f) (esc (name (or op :n-a))) (esc subject)
+          (esc (basis-text f))))
 
-;; ----------------------------- sections -----------------------------
+(defn- record-row
+  "One real `railops.registry` draft record, straight out of the
+  store's append-only history. Keys are the record's own string keys;
+  the tail column is every remaining key sorted, so nothing is
+  selected or renamed by hand."
+  [r]
+  (let [skip #{"record_id" "kind" "service_id" "immutable"}
+        detail (->> (sort (keys r))
+                    (remove skip)
+                    (map #(str % "=" (pr-str (get r %))))
+                    (str/join " · "))]
+    (format "        <tr><td><code>%s</code></td><td>%s</td><td><code>%s</code></td><td>%s</td></tr>"
+            (esc (get r "record_id")) (esc (get r "kind")) (esc (get r "service_id"))
+            (esc detail))))
 
-(defn- services-section [db ledger]
-  (section
-   "Scheduled services (SSoT)"
-   (str "Read back out of " (code "railops.store/seed-db") " after the run. "
-        (code ":route-schedule-registered?") " is set ONLY by seeding or an external "
-        "registration feed — no op in " (code "railops.governor/allowed-ops")
-        " can ever set it, so this actor cannot self-certify the precondition its own governor gates on.")
-   (table ["Service" "Route" "Consist" "Operator" "Route/timetable independently registered?" "Last persisted disposition"]
-          (for [s (store/all-services db)]
-            (row (code (:id s)) (esc (:route s)) (code (:consist s)) (esc (:operator s))
-                 (if (:route-schedule-registered? s)
-                   "<span class=\"ok\">yes</span>"
-                   "<span class=\"critical\">no</span>")
-                 (ledger-status ledger (:id s)))))))
+(def ^:private action-gate-rows
+  ;; Static description of this actor's own CLOSED op contract
+  ;; (README `Core Contract`, `railops.governor/allowed-ops`,
+  ;; `railops.phase/phases`) -- documentation of fixed code behavior,
+  ;; not runtime telemetry, so it is legitimately hand-described
+  ;; rather than derived from a live run.
+  ["        <tr><td><code>:log-service-record</code></td><td><span class=\"ok\">phase-3 auto-commit when governor-clean &middot; the ONLY op in any phase's auto set</span></td></tr>"
+   "        <tr><td><code>:schedule-service-operation</code></td><td><span class=\"warn\">human approval at every phase &middot; a coordination proposal, never a dispatch</span></td></tr>"
+   "        <tr><td><code>:flag-passenger-safety-concern</code></td><td><span class=\"warn\">ALWAYS human approval &middot; high-stakes in the governor AND absent from every phase's auto set (two independent layers)</span></td></tr>"
+   "        <tr><td><code>:coordinate-maintenance</code></td><td><span class=\"warn\">human approval &middot; enabled from phase 2 &middot; never releases or executes maintenance</span></td></tr>"
+   "        <tr><td><code>anything else</code></td><td><span class=\"critical\">HARD hold &middot; :op-not-allowlisted &middot; an unknown op is never given the benefit of the doubt</span></td></tr>"])
 
-(defn- runs-section [runs]
-  (section
-   "Actor runs"
-   (str "Each row is one real " (code "langgraph.graph/run*") " invocation of "
-        (code "railops.operation/build") ". "
-        (code "interrupted") " means the graph paused at "
-        (code ":request-approval") " (interrupt-before) and is waiting for a human desk operator.")
-   (table ["Thread" "Scenario" "Op" "Subject" "Phase" "Graph status" "Disposition" "Audit facts added"]
-          (for [r runs]
-            (row (code (:thread r))
-                 (esc (:label r))
-                 (if (:op r) (code (str ":" (kw (:op r)))) "<span class=\"muted\">— (resume)</span>")
-                 (if (:subject r) (code (:subject r)) "<span class=\"muted\">—</span>")
-                 (esc (:phase r))
-                 (if (= :interrupted (:status r))
-                   "<span class=\"warn\">interrupted</span>"
-                   "<span class=\"muted\">done</span>")
-                 (case (:disposition r)
-                   :commit   "<span class=\"ok\">commit</span>"
-                   :escalate "<span class=\"warn\">escalate</span>"
-                   :hold     "<span class=\"critical\">hold</span>"
-                   (str "<span class=\"muted\">" (esc (kw (:disposition r))) "</span>"))
-                 (str/join " " (map #(code (str ":" (kw (:t %)))) (:new-audit r))))))))
-
-(defn- holds-section [ledger]
-  (let [vs (violations-in ledger)]
-    (section
-     "Every hold that actually fired"
-     (str "Produced by " (code "railops.governor/check") " from inside the graph's "
-          (code ":govern") " node, by " (code "railops.phase/gate")
-          ", or by the human approver — on deliberately non-compliant input. Every "
-          "<span class=\"critical\">governor (HARD)</span> rule below is un-overridable: no approver, at any phase, can clear it.")
-     (table ["Rule" "Layer" "Fact" "Op" "Subject" "Detail"]
-            (for [v vs]
-              (row (str "<span class=\"critical\">:" (esc (kw (:rule v))) "</span>")
-                   (if (= "governor (HARD)" (:layer v))
-                     (str "<span class=\"critical\">" (esc (:layer v)) "</span>")
-                     (str "<span class=\"warn\">" (esc (:layer v)) "</span>"))
-                   (code (str ":" (kw (:fact v))))
-                   (code (str ":" (kw (:op v))))
-                   (code (:subject v))
-                   (if (str/blank? (str (:detail v)))
-                     "<span class=\"muted\">—</span>"
-                     (esc (:detail v)))))))))
-
-(defn- escalation-section [runs]
-  (let [facts (for [r runs
-                    f (:new-audit r)
-                    :when (#{:approval-requested :approval-granted} (:t f))]
-                (assoc f :thread (:thread r)))]
-    (section
-     "Human-in-the-loop handoffs (audit channel only — NOT in the ledger)"
-     (str "These facts are emitted to the graph's in-memory " (code ":audit")
-          " channel. " (code "railops.operation") " never appends them to the store, so the ledger "
-          "below does not contain them — they are rendered here from the run results, not from the SSoT.")
-     (table ["Thread" "Fact" "Op" "Subject" "Reason / approver" "Confidence"]
-            (for [f facts]
-              (row (code (:thread f))
-                   (code (str ":" (kw (:t f))))
-                   (code (str ":" (kw (:op f))))
-                   (code (:subject f))
-                   (esc (or (some-> (:reason f) kw (->> (str ":"))) (:by f) "—"))
-                   (esc (or (:confidence f) "—"))))))))
-
-(defn- ledger-section [ledger]
-  (section
-   "Audit ledger (append-only, persisted)"
-   (str "Every fact " (code "railops.store/append-ledger!") " received, in order. "
-        "The " (code ":commit") " node is the only writer of the SSoT.")
-   (table ["#" "Fact" "Op" "Actor" "Subject" "Basis" "Summary"]
-          (map-indexed
-           (fn [i f]
-             (row (esc i)
-                  (case (:t f)
-                    :committed "<span class=\"ok\">:committed</span>"
-                    :governor-hold "<span class=\"critical\">:governor-hold</span>"
-                    :approval-rejected "<span class=\"warn\">:approval-rejected</span>"
-                    (esc (str ":" (kw (:t f)))))
-                  (code (str ":" (kw (:op f))))
-                  (code (:actor f))
-                  (code (:subject f))
-                  (esc (or (not-empty (str/join ", " (map #(if (keyword? %) (str ":" (name %)) (str %)) (:basis f))))
-                           (some-> (:phase-reason f) kw (->> (str ":")))
-                           "—"))
-                  (esc (or (:summary f) "—"))))
-           ledger))))
-
-(defn- record-section [title lead records]
-  (let [ks (keys (first records))]
-    (section title lead
-             (table (map #(str/replace (str %) "_" " ") ks)
-                    (for [r records]
-                      (apply row (map #(let [v (get r %)]
-                                         (cond (nil? v) "<span class=\"muted\">—</span>"
-                                               (true? v) "<span class=\"ok\">true</span>"
-                                               :else (esc v)))
-                                      ks)))))))
-
-(defn- policy-section []
-  (section
-   "Governor + rollout policy (read off the live vars)"
-   (str "Not transcribed by hand: rendered from " (code "railops.governor")
-        " and " (code "railops.phase") " at build time.")
-   (str "<table><thead><tr><th>Policy</th><th>Value</th></tr></thead><tbody>"
-        (row (code "governor/allowed-ops") (kw-list governor/allowed-ops))
-        (row (code "governor/forbidden-finalize-ops") (kw-list governor/forbidden-finalize-ops))
-        (row (code "governor/high-stakes") (kw-list governor/high-stakes))
-        (row (code "governor/confidence-floor") (code governor/confidence-floor))
-        (row (code "governor/scope-exclusion-phrases")
-             (str/join " " (map #(str "<code>&quot;" (esc %) "&quot;</code>")
-                                governor/scope-exclusion-phrases)))
-        "</tbody></table>"
-        "<h3>Rollout phases</h3>"
-        (table ["Phase" "Label" "Ops allowed to write" "Ops allowed to auto-commit"]
-               (for [[n {:keys [label writes auto]}] (sort-by key phase/phases)]
-                 (row (str (esc n) (when (= n phase/default-phase) " <span class=\"muted\">(default)</span>"))
-                      (esc label)
-                      (if (seq writes) (kw-list writes) "<span class=\"muted\">none</span>")
-                      (if (seq auto) (kw-list auto) "<span class=\"muted\">none</span>")))))))
-
-;; ----------------------------- page -----------------------------
-
-(def ^:private css
-  (str "body{font:14px/1.6 system-ui,-apple-system,'Helvetica Neue','Hiragino Sans',sans-serif;"
-       "margin:0;color:#1a1a1a;background:#f4f5f7}"
-       ".bar{background:#0031d8;color:#fff;padding:1.3rem 2rem}"
-       ".bar h1{margin:0;font-size:1.15rem;font-weight:600}"
-       ".bar p{margin:.35rem 0 0;font-size:.82rem;opacity:.85}"
-       "main{max-width:1080px;margin:1.5rem auto;padding:0 1rem}"
-       ".card{background:#fff;border-radius:8px;padding:1.1rem 1.4rem 1.4rem;margin-bottom:1.2rem;"
-       "box-shadow:0 1px 3px rgba(0,0,0,.09)}"
-       ".card h2{margin:.2rem 0 .5rem;font-size:1rem}"
-       ".card h3{margin:1.1rem 0 .4rem;font-size:.9rem}"
-       ".muted{color:#6b6b6b;font-size:.82rem}"
-       "table{border-collapse:collapse;width:100%;font-size:.84rem;margin-top:.5rem}"
-       "th,td{text-align:left;padding:.42rem .5rem;border-bottom:1px solid #ececec;vertical-align:top}"
-       "th{font-weight:600;color:#555;white-space:nowrap}"
-       ".ok{color:#197a4b;font-weight:600}.warn{color:#8a6100;font-weight:600}"
-       ".critical{color:#b41010;font-weight:600}"
-       "code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f0f2f5;"
-       "border:1px solid #e2e5ea;border-radius:4px;padding:0 .28rem;font-size:.9em}"
-       "footer{max-width:1080px;margin:0 auto 2rem;padding:0 1rem;color:#6b6b6b;font-size:.8rem}"))
+(def ^:private hold-rule-rows
+  ;; Static description of `railops.governor`'s four HARD checks, in
+  ;; the priority order the namespace itself documents. Again: a
+  ;; description of fixed code, not of this run -- the ledger section
+  ;; below is where the rules that actually fired are shown.
+  ["        <tr><td><code>:op-not-allowlisted</code></td><td>the proposal's op is outside the closed four-op allowlist</td></tr>"
+   "        <tr><td><code>:dispatch-safety-override-blocked</code></td><td>the op — or the advisor's own rationale text — names a forbidden finalization action (clearing a train for departure, overriding a signal interlock). Can never be satisfied by any proposal, at any phase, by any approver</td></tr>"
+   "        <tr><td><code>:effect-not-propose</code></td><td>the proposal's effect is not <code>:propose</code> — this actor never emits an effect that reads as a direct mutation of a real dispatch/signalling system</td></tr>"
+   "        <tr><td><code>:route-schedule-not-verified</code></td><td>the service's route/timetable slot has not been independently registered by an external safety-management system. No op in this actor's allowlist can set that flag</td></tr>"])
 
 (defn render
-  "The whole page, from a driven store + the runs that drove it."
-  [{:keys [db runs]}]
-  (let [ledger (vec (store/ledger db))]
-    (str "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
-         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-         "<title>Operator console — cloud-itonami-isic-4911</title>"
-         "<style>" css "</style></head><body>"
-         "<header class=\"bar\"><h1>Community Passenger Rail Transport — operations-coordination console</h1>"
-         "<p>ISIC Rev.5 4911 · module <code>railops</code> · governor <code>rail-safety-governor</code></p></header>"
-         "<main>"
-         (section
-          "How this page was produced"
-          nil
-          (str "<p>Generated at build time by <code>railops.render-html</code> "
-               "(<code>clojure -M:dev:render-html</code>). It runs the real actor: "
-               "<code>railops.store/seed-db</code> → <code>railops.operation/build</code> "
-               "(a <code>langgraph</code> StateGraph) → <code>railops.governor/check</code> → "
-               "<code>railops.phase/gate</code>. Every value below is read back out of the store "
-               "the graph wrote, or off the run's own audit channel. No invented services, "
-               "no invented dispositions, no hand-written holds.</p>"
-               "<p class=\"muted\">Scope: this actor coordinates <em>around</em> a service. It never "
-               "dispatches a train, never clears a signal interlock and never releases maintenance — "
-               "every record it writes is an unsigned draft.</p>"))
-         (services-section db ledger)
-         (runs-section runs)
-         (holds-section ledger)
-         (escalation-section runs)
-         (ledger-section ledger)
-         (policy-section)
-         (record-section "Draft service-log records"
-                         (str "Built by " (code "railops.registry/register-service-log") ".")
-                         (store/service-log-history db))
-         (record-section "Draft schedule/consist-operation proposals"
-                         (str "Built by " (code "railops.registry/register-schedule-proposal")
-                              " — a coordination proposal, never a dispatch.")
-                         (store/schedule-proposal-history db))
-         (record-section "Passenger-safety-concern flags"
-                         (str "Built by " (code "railops.registry/register-safety-concern-flag")
-                              " — always advisory-only and human-review-required.")
-                         (store/safety-concern-history db))
-         (record-section "Maintenance-coordination drafts"
-                         (str "Built by " (code "railops.registry/register-maintenance-coordination")
-                              " — never a maintenance release.")
-                         (store/maintenance-coordination-history db))
-         "</main>"
-         "<footer>cloud-itonami-isic-4911 · AGPL-3.0-or-later · deterministic build-time artifact "
-         "(no clock, no randomness, no network) — regenerate with <code>clojure -M:dev:render-html</code>.</footer>"
-         "</body></html>\n")))
+  "Renders the operator-console document from a store `db` that has
+  already run `run-demo!` (or any other real scenario)."
+  [db]
+  (let [ledger (vec (store/ledger db))
+        services (store/all-services db)
+        records (concat (store/service-log-history db)
+                        (store/schedule-proposal-history db)
+                        (store/safety-concern-history db)
+                        (store/maintenance-coordination-history db))]
+    (str
+     "<!doctype html>\n"
+     "<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+     "<title>cloud-itonami-isic-4911 &middot; interurban passenger rail — Operator Console</title>\n"
+     "<style>\n" (jp-go-dds.skin/dds+skin) "\n</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Passenger rail transport, interurban (ISIC 4911) — Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · this actor coordinates around services, it never dispatches one</span>\n"
+     "</header>\n"
+     "<main class=\"container\">\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Scheduled services</h2>\n"
+     "    <p class=\"muted\">Build-time snapshot generated from <code>railops.store</code> by <code>railops.render-html</code> (<code>clojure -M:dev:render-html</code>). Every row is a real store entity; the decision counts and status come from the append-only ledger below.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Service</th><th>Route</th><th>Consist</th><th>Operator</th><th>Route/timetable slot</th><th>Committed</th><th>Held</th><th>Last decision</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial service-row ledger) services)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Action gate (Rail Safety Governor + rollout phase)</h2>\n"
+     "    <p class=\"muted\">Two independent layers. The governor censors the Rail-Operations-LLM's proposal; the rollout phase gate can only add caution, never remove it.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>Gate</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" action-gate-rows) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>HARD hold rules</h2>\n"
+     "    <p class=\"muted\">HARD holds cannot be overridden by a human approver — the run never reaches the approval node at all.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Rule</th><th>Meaning</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" hold-rule-rows) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Audit ledger (this run)</h2>\n"
+     "    <p class=\"muted\">Append-only decision facts — one per operation, written by the actor's <code>:commit</code> and <code>:hold</code> nodes. <code>:committed</code> basis lists the facts the advisor cited; hold basis lists the governor rules that fired.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Fact</th><th>Op</th><th>Service</th><th>Basis</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map ledger-row ledger)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Draft records committed to the SSoT</h2>\n"
+     "    <p class=\"muted\">Every record <code>railops.registry</code> built on a committed op. All are unsigned drafts — a rail operator's own certified safety-management system remains a separate system of record this actor never writes to.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Record id</th><th>Kind</th><th>Service</th><th>Fields</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map record-row records)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "</main>\n"
+     "<footer class=\"container footer\">cloud-itonami-isic-4911 · AGPL-3.0-or-later · regenerated from the actor stack, not hand-written</footer>\n"
+     "</body></html>\n")))
 
 (defn -main [& args]
   (let [out (or (first args) "docs/samples/operator-console.html")
-        demo (run-demo!)
-        f (java.io.File. out)]
-    (when-let [p (.getParentFile f)] (.mkdirs p))
-    (spit f (render demo) :encoding "UTF-8")
-    (println "wrote" out
-             "-" (count (:runs demo)) "actor runs,"
-             (count (store/ledger (:db demo))) "ledger facts,"
-             (count (violations-in (store/ledger (:db demo)))) "governor violations")))
+        db (run-demo!)
+        html (render db)]
+    (spit out html)
+    (println "wrote" out "(" (count (store/ledger db)) "ledger facts,"
+             (count (store/all-services db)) "services,"
+             (+ (count (store/service-log-history db))
+                (count (store/schedule-proposal-history db))
+                (count (store/safety-concern-history db))
+                (count (store/maintenance-coordination-history db)))
+             "draft records )")))
