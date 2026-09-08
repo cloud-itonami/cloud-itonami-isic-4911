@@ -97,7 +97,7 @@
   to a human -- never auto-commits at any phase (`railops.phase`
   independently agrees: no phase's `:auto` set ever contains
   `:flag-passenger-safety-concern`). Two independent layers, not one."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [railops.store :as store]))
 
 (def confidence-floor 0.6)
@@ -152,7 +152,7 @@
       :detail (str op " は本アクターの閉じた提案op許可リストに含まれない")}]))
 
 (defn- proposal-text-blob [proposal]
-  (str/lower-case
+  (str/lower
    (str (:rationale proposal) " " (:summary proposal) " "
         (str/join " " (map str (:cites proposal))))))
 
