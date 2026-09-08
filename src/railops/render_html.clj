@@ -28,7 +28,7 @@
       are emitted to the in-memory `:audit` channel ONLY and are never
       written to the ledger by `railops.operation` -- they are rendered
       from the run results, in their own section, labelled as such."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [langgraph.graph :as g]
             [railops.governor :as governor]
             [railops.operation :as op]
