@@ -1,5 +1,5 @@
 (ns railops.sim
-  "Demo driver -- `clojure -M:dev:run`. Walks a clean service through
+  "Demo driver -- `kbb -M:dev:run`. Walks a clean service through
   log -> schedule-coordination (escalate/approve/commit) ->
   passenger-safety-concern flag (always escalate/approve/commit) ->
   maintenance coordination (escalate/approve/commit), then shows

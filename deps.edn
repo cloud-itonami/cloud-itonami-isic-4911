@@ -26,9 +26,9 @@
   :dev {:override-deps
         {io.github.kotoba-lang/langchain
          {:local/root "../../kotoba-lang/langchain"}}}
-  ;; clojure -M:dev:run  -> drive the demo through one OperationActor
+  ;; kbb -M:dev:run  -> drive the demo through one OperationActor
   :run {:main-opts ["-m" "railops.sim"]}
-  ;; clojure -M:dev:render-html -> drive the REAL actor stack and write
+  ;; kbb -M:dev:render-html -> drive the REAL actor stack and write
   ;; docs/samples/operator-console.html (deterministic build-time
   ;; artifact -- no server, no clock, no network).
   :render-html {:main-opts ["-m" "railops.render-html"]}
