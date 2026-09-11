@@ -1,6 +1,6 @@
 (ns railops.render-html
   "Build-time HTML renderer for the community interurban-passenger-rail
-  operations-coordination actor -- `clojure -M:dev:render-html`.
+  operations-coordination actor -- `kbb -M:dev:render-html`.
 
   This is NOT a mock console. It drives the REAL actor stack
   deterministically and offline:
@@ -431,7 +431,7 @@
           "How this page was produced"
           nil
           (str "<p>Generated at build time by <code>railops.render-html</code> "
-               "(<code>clojure -M:dev:render-html</code>). It runs the real actor: "
+               "(<code>kbb -M:dev:render-html</code>). It runs the real actor: "
                "<code>railops.store/seed-db</code> → <code>railops.operation/build</code> "
                "(a <code>langgraph</code> StateGraph) → <code>railops.governor/check</code> → "
                "<code>railops.phase/gate</code>. Every value below is read back out of the store "
@@ -463,7 +463,7 @@
                          (store/maintenance-coordination-history db))
          "</main>"
          "<footer>cloud-itonami-isic-4911 · AGPL-3.0-or-later · deterministic build-time artifact "
-         "(no clock, no randomness, no network) — regenerate with <code>clojure -M:dev:render-html</code>.</footer>"
+         "(no clock, no randomness, no network) — regenerate with <code>kbb -M:dev:render-html</code>.</footer>"
          "</body></html>\n")))
 
 (defn -main [& args]
