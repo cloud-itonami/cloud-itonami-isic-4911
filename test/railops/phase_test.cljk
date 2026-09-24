@@ -3,7 +3,7 @@
   regress on: `:flag-passenger-safety-concern` must NEVER be a member
   of any phase's `:auto` set -- flagging a passenger-safety concern
   always needs a human's eyes."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [railops.phase :as phase]
             [railops.governor :as governor]))
 

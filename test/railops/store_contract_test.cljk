@@ -6,7 +6,7 @@
   `underwriting.store-contract-test` for the same pattern on the
   sibling actor, and `cloud-itonami-isic-4920`'s own
   `freightops.store-contract-test`."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [railops.store :as store]))
 
 (defn- backends []
