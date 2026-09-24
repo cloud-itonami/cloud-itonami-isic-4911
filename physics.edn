@@ -1,0 +1,33 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": robots perform the physical work of interurban
+;; passenger rail (ISIC 4911) -- track inspection, rolling-stock maintenance,
+;; signal-system testing. Here: a rail-borne track-inspection trolley that
+;; must stop short of an obstruction on steel rail (low adhesion), and a
+;; depot arm swapping brake blocks on a bogie.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-4911"
+ :cases
+ [{:id :inspection-trolley-stop
+   :kind :transport
+   :procedure "rail-borne track-inspection trolley runs a 400 m inspection section at 5 m/s and stops for an obstruction; rail adhesion (dry to leaf-contaminated) sets the braking deceleration"
+   :params {:mass-kg 350.0 :payload-kg 50.0 :distance-m 400.0 :v-max-mps 5.0 :a-max-mps2 0.5
+            :drive-force-n 1500.0 :crr 0.002 :cog-height-m 0.50
+            :support-half-length-m 0.60 :max-time-s 900.0}
+   :sweep {:param :brake-decel-mps2 :values [0.3 0.5 0.8 1.2 1.6 2.0]}
+   :quantity :stopping-distance-m
+   :limit {:max 20.0 :basis "estimate: the trolley's obstacle sensing is assumed to see ~20 m ahead on curved track; the deceleration range for dry vs contaminated rail is an estimate too"}
+   :boundary {:lo 0.1 :hi 3.0}}
+  {:id :brake-block-swap-on-bogie
+   :kind :manipulator
+   :procedure "depot arm working from the inspection pit lifts a new brake block up into the bogie's brake head"
+   :params {:l1-m 0.55 :l2-m 0.50 :m1-kg 6.0 :m2-kg 4.0
+            :from [0.45 -0.35] :to [0.70 0.25] :duration-s 3.0 :steps 500}
+   :sweep {:param :payload-kg :values [3.0 5.0 8.0 11.0 14.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 100.0 :basis "estimate: continuous shoulder torque of a ~8 kg-payload collaborative arm; block masses (composite to cast-iron) are estimates"}
+   :boundary {:lo 0.5 :hi 50.0}}]}
